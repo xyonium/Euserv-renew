@@ -153,7 +153,7 @@ def solve_captcha_with_qwen_vision(image_bytes):
     )
     
     response = client.chat.completions.create(
-        model="qwen-vl-max",  # 或使用 qwen-vl-plus，根据需要选择
+        model="qwen3.5-ocr",  # 或使用 qwen-vl-plus，根据需要选择
         messages=[
             {
                 "role": "user",
