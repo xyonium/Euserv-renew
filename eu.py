@@ -511,27 +511,50 @@ def login(username: str, password: str) -> (str, requests.session):
 
 
 def get_servers(sess_id: str, session: requests.session) -> {}:
+    """枚举账户下所有订单合同及其是否需要续期。
+
+    注意：必须扫描全部订单标签页（kc2_order_customer_orders_tab_content_*），
+    不能只看 tab_content_1——账户里有多个合同（如 VPS + ESS 存储试用）时，
+    VPS 可能不在第一个标签页（2026-09 事故：脚本只续到了 ESS 合同 488048，
+    真正的 VS2 合同 481668 被漏掉）。
+    """
     d = {}
     url = "https://support.euserv.com/index.iphp?sess_id=" + sess_id
     headers = {"user-agent": user_agent, "origin": "https://www.euserv.com"}
     r = session.get(url=url, headers=headers)
     r.raise_for_status()
+    # 概览页存档：合同枚举是否正确只能靠它事后复核
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        with open(os.path.join(DEBUG_DIR, "overview_get_servers.html"), "w") as f:
+            f.write(r.text)
+    except Exception:
+        pass
     soup = BeautifulSoup(r.text, "html.parser")
-    for tr in soup.select(
-        "#kc2_order_customer_orders_tab_content_1 .kc2_order_table.kc2_content_table tr"
-    ):
-        server_id = tr.select(".td-z1-sp1-kc")
-        if not len(server_id) == 1:
-            continue
-        flag = (
-            True
-            if tr.select(".td-z1-sp2-kc .kc2_order_action_container")[0]
-            .get_text()
-            .find("Contract extension possible from")
-            == -1
-            else False
-        )
-        d[server_id[0].get_text()] = flag
+    tabs = soup.select("[id^='kc2_order_customer_orders_tab_content_']")
+    if not tabs:  # 面板结构变化时兜底：全页面找订单表
+        tabs = [soup]
+        log("[EUserv] 警告: 未找到订单标签页容器，退化为全表扫描")
+    for tab in tabs:
+        tab_id = tab.get("id", "?")
+        for tr in tab.select(".kc2_order_table.kc2_content_table tr"):
+            server_id = tr.select(".td-z1-sp1-kc")
+            if not len(server_id) == 1:
+                continue
+            key = server_id[0].get_text().strip()
+            if key in d:
+                continue
+            flag = (
+                True
+                if tr.select(".td-z1-sp2-kc .kc2_order_action_container")[0]
+                .get_text()
+                .find("Contract extension possible from")
+                == -1
+                else False
+            )
+            d[key] = flag
+            log("[EUserv] 合同 %s [%s] 需续期=%s | %s"
+                % (key, tab_id, flag, _snippet(tr.get_text(" ", strip=True), 160)))
     return d
 
 
@@ -801,13 +824,20 @@ def extract_pin_from_body(body: str) -> str:
     log("[Email] 未找到符合要求的 6 位数字 PIN")
     return None
 # ===================== 续期生效校验（事实判据） =====================
-DATE_RE = re.compile(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b")
+DATE_RE = re.compile(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b")        # 德式 DD.MM.YYYY
+ISO_DATE_RE = re.compile(r"\b(20\d\d)-(\d{2})-(\d{2})\b")          # 面板实际使用 YYYY-MM-DD
 END_HINTS = (
     "contract end", "end of contract", "contract term end", "end of the contract",
+    "end of contract period", "contract period end",
     "contract expires", "expiry", "expiration",
     "cancelled at", "canceled at", "cancellation", "cancel at", "terminat",
     "kündig", "kuendig", "vertragsende", "laufzeitende",
     "gültig bis", "gueltig bis", "runs until",
+)
+# 自动续期合同的标识（出现即说明无需/不可手动续期）
+AUTO_RENEW_HINTS = (
+    "contract is extended automatically",           # 执行续期时的错误提示
+    "extend the contract automatically until",      # 详情页终止说明文字
 )
 VERIFY_TIMEOUT = 90          # 续期后面板状态轮询总时长（秒）
 VERIFY_INTERVAL = 6          # 轮询间隔（秒）
@@ -818,20 +848,44 @@ def _de_date(m) -> "_date":
     return _date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
 
 
-def extract_dates_with_context(html_text: str, ctx_len: int = 80) -> list:
-    """从 HTML 中提取所有 DD.MM.YYYY 日期及其前置上下文标签。"""
+def _iso_date(m) -> "_date":
+    return _date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def _strip_html(html_text: str) -> str:
     text = re.sub(r"<script[\s\S]*?</script>", " ", html_text or "", flags=re.I)
     text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
     text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text)
+    return re.sub(r"\s+", " ", text.replace("&nbsp;", " "))
+
+
+def is_auto_renew_text(html_text: str) -> bool:
+    """检测页面是否表明该合同为自动续期（无需也不允许手动续期）。"""
+    plain = _strip_html(html_text).lower()
+    return any(h in plain for h in AUTO_RENEW_HINTS)
+
+
+def extract_kc2_error_text(html_text: str) -> str:
+    """提取 KC2 页面中的红色错误行（td.verdana14px-rot-b）文本。"""
+    errs = re.findall(
+        r'<td[^>]*class="[^"]*verdana14px-rot-b[^"]*"[^>]*>(.*?)</td>',
+        html_text or "", re.S | re.I)
+    text = " ".join(_strip_html(e) for e in errs).strip()
+    return text
+
+
+def extract_dates_with_context(html_text: str, ctx_len: int = 80) -> list:
+    """从 HTML 中提取所有日期（德式 DD.MM.YYYY 与 ISO YYYY-MM-DD）及其前置上下文标签。"""
+    text = _strip_html(html_text)
     out = []
-    for m in DATE_RE.finditer(text):
-        try:
-            d = _de_date(m)
-        except ValueError:
-            continue
-        ctx = text[max(0, m.start() - ctx_len):m.start()].strip()
-        out.append((ctx, d))
+    for regex, parser in ((DATE_RE, _de_date), (ISO_DATE_RE, _iso_date)):
+        for m in regex.finditer(text):
+            try:
+                d = parser(m)
+            except ValueError:
+                continue
+            ctx = text[max(0, m.start() - ctx_len):m.start()].strip()
+            out.append((ctx, d))
     return out
 
 
@@ -841,7 +895,10 @@ def pick_contract_end_date(html_text: str):
     if pairs:
         log("[EUserv] 详情页日期: " + "; ".join(
             "{} ← '{}'".format(d, c[-40:]) for c, d in pairs[:12]))
-    matched = [d for c, d in pairs if any(h in c.lower() for h in END_HINTS)]
+    matched = [d for c, d in pairs
+               if any(h in c.lower() for h in END_HINTS)
+               # "automatically extended until <date>" 是自动续期的目标日，不是当前到期日
+               and "automatically until" not in c.lower()]
     if not matched:
         return None
     return max(matched)
@@ -864,14 +921,15 @@ def fetch_contract_details(session, sess_id: str, order_id: str, headers: dict):
 
 
 def get_server_action_text(session, sess_id: str, order_id: str) -> str:
-    """服务器列表中该订单操作列的文本（续期按钮 / 'Contract extension possible from ...'）。"""
+    """服务器列表中该订单操作列的文本（续期按钮 / 'Contract extension possible from ...'）。
+    与 get_servers 一样扫描所有订单标签页。"""
     url = "https://support.euserv.com/index.iphp?sess_id=" + sess_id
     headers = {"user-agent": user_agent, "origin": "https://www.euserv.com"}
     r = session.get(url=url, headers=headers, timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     for tr in soup.select(
-        "#kc2_order_customer_orders_tab_content_1 .kc2_order_table.kc2_content_table tr"
+        "[id^='kc2_order_customer_orders_tab_content_'] .kc2_order_table.kc2_content_table tr"
     ):
         server_id = tr.select(".td-z1-sp1-kc")
         if not len(server_id) == 1:
@@ -884,10 +942,37 @@ def get_server_action_text(session, sess_id: str, order_id: str) -> str:
     return ""
 
 
+# 主界面的服务级停用警告，例如：
+# "The service will be automatically deactivated on 2026-09-09 if it is not extended manually."
+# 这是"服务是否真的需要手动续期"的最强事实信号——合同层"extended automatically"
+# 不代表服务层无需续期，以这条警告是否存在为准。
+DEACTIVATION_RE = re.compile(
+    r"automatically deactivated on\s+((?:20\d\d-\d{2}-\d{2})|(?:\d{1,2}\.\d{1,2}\.\d{4}))",
+    re.I)
+
+
+def get_deactivation_warnings(session, sess_id: str) -> list:
+    """抓取概览页"不手动续期将自动停用"警告。返回去重后的警告句子列表。"""
+    url = "https://support.euserv.com/index.iphp?sess_id=" + sess_id
+    headers = {"user-agent": user_agent, "origin": "https://www.euserv.com"}
+    try:
+        r = session.get(url=url, headers=headers, timeout=30)
+        r.raise_for_status()
+    except Exception as e:
+        log("[Verify] 概览页获取异常（无法检查停用警告）: {}".format(e))
+        return []
+    text = _strip_html(r.text)
+    warnings = []
+    for m in DEACTIVATION_RE.finditer(text):
+        start = max(0, m.start() - 120)
+        warnings.append(text[start:m.end() + 80].strip())
+    return list(dict.fromkeys(warnings))
+
+
 def classify_extend_response(r) -> (str, str):
     """
     判定 extend_contract_term 响应: 返回 (status, detail)
-    status ∈ {"success", "error", "unknown"}
+    status ∈ {"success", "error", "auto_renew", "unknown"}
     """
     text = r.text or ""
     try:
@@ -901,16 +986,21 @@ def classify_extend_response(r) -> (str, str):
             return "unknown", _snippet(text, 300)
     except ValueError:
         pass
-    # 非 JSON（不应发生，可能会话失效/被拦截）：去标签后查错误标记
-    plain = re.sub(r"<[^>]+>", " ", text)
-    plain_low = re.sub(r"\s+", " ", plain).lower()
+    # 非 JSON（完整 KC2 页面）：优先提取红色错误行，并识别自动续期合同
+    if is_auto_renew_text(text):
+        err = extract_kc2_error_text(text)
+        return "auto_renew", err or "contract is extended automatically"
+    err = extract_kc2_error_text(text)
+    if err:
+        return "error", _snippet(err, 500)
+    plain_low = _strip_html(text).lower()
     for marker in ("error", "fehler", "not possible", "nicht möglich",
                    "nicht moeglich", "invalid", "ungültig", "ungueltig", "failed"):
         if marker in plain_low:
-            return "error", _snippet(plain, 500)
+            return "error", _snippet(plain_low, 500)
     if "success" in plain_low or "erfolgreich" in plain_low:
-        return "success", _snippet(plain, 300)
-    return "unknown", _snippet(plain, 300)
+        return "success", _snippet(plain_low, 300)
+    return "unknown", _snippet(plain_low, 300)
 
 
 def validate_confirmation_dialog(r, order_id: str):
@@ -926,11 +1016,17 @@ def validate_confirmation_dialog(r, order_id: str):
             if rs and rs != "success":
                 log("[EUserv] 续期确认对话框返回错误: {}".format(_snippet(text, 500)))
                 return False, {}
-            # 部分 KC2 接口把对话框 HTML 包在 JSON 字段里
-            for key in ("html", "content", "dialog", "data"):
-                if isinstance(j.get(key), str):
-                    text = j[key]
-                    break
+            # KC2 把对话框 HTML 包在 JSON 里，形如 {"html": {"value": "<form>..."}}
+            inner = j.get("html")
+            if isinstance(inner, dict):
+                inner = inner.get("value")
+            if not isinstance(inner, str):
+                for key in ("content", "dialog", "data"):
+                    if isinstance(j.get(key), str):
+                        inner = j[key]
+                        break
+            if isinstance(inner, str):
+                text = inner
     except ValueError:
         pass
     low = text.lower()
@@ -1027,7 +1123,9 @@ def wait_extension_applied(session, sess_id: str, order_id: str, before_end, hea
 
 def renew(
     sess_id: str, session: requests.session, password: str, order_id: str
-) -> bool:
+) -> str:
+    """执行续期流程。返回 "success" / "failed" / "auto_renew"（合同层声称自动续期，
+    手动续期被拒——不代表服务无需续期，终检以面板停用警告为准）。"""
     url = "https://support.euserv.com/index.iphp"
     headers = {
         "user-agent": user_agent,
@@ -1047,10 +1145,15 @@ def renew(
             "choose_order_subaction": "show_contract_details",
         }, always_dump=True)
         if r is None:
-            return False
+            return "failed"
         before_end = pick_contract_end_date(r.text)
         log("[EUserv] ServerID %s 续期前合同到期日: %s" %
             (order_id, before_end or "未能解析（将使用辅助判据）"))
+        # 详情页含自动续期标识只作提示，绝不跳过——EUserv 的合同自动滚动
+        # 不等于免费服务无需手动续期（主界面停用警告为准），流程照常继续
+        if is_auto_renew_text(r.text):
+            log("[EUserv] ServerID %s 详情页含自动续期（extended automatically）标识，"
+                "仍将尝试手动续期，最终以面板停用警告复核" % order_id)
 
         # Step 2: change plan 对话框
         r = _post_step(session, url, headers, order_id, "2_change_plan_dialog", {
@@ -1060,7 +1163,7 @@ def renew(
             "show_manual_extension_if_available": "1",
         })
         if r is None:
-            return False
+            return "failed"
 
         # Step 3: 触发安全验证 PIN 邮件
         request_time = time.time()
@@ -1072,18 +1175,18 @@ def renew(
             "type": "1",
         })
         if r is None:
-            return False
+            return "failed"
         if 'PIN sent to ***' in r.text or 'Enter PIN' in r.text or 'kc2_security_password_dialog_prompt' in r.text:
             log('[EUserv] A PIN has been sent to your email address')
         else:
             log("[EUserv] Send Email failed ! 返回消息：{}".format(_snippet(r.text, 1000)))
-            return False
+            return "failed"
 
         # Step 4: 从邮箱取 PIN
         pin_code = wait_for_email(request_time)
         log("[Email PIN Solver] 驗證碼是: {}".format(pin_code))
         if not pin_code:
-            return False
+            return "failed"
 
         # Step 5: PIN 换 token
         r = _post_step(session, url, headers, order_id, "5_get_token", {
@@ -1095,19 +1198,19 @@ def renew(
             "ident": "kc2_customer_contract_details_extend_contract_" + order_id,
         }, always_dump=True)
         if r is None:
-            return False
+            return "failed"
         try:
             j = r.json()
         except ValueError:
             log("[EUserv] token 接口返回非 JSON: {}".format(_snippet(r.text, 500)))
-            return False
+            return "failed"
         if not j.get("rs") == "success":
             log("[EUserv] 获取续期 token 失败: {}".format(_snippet(r.text, 500)))
-            return False
+            return "failed"
         token = (j.get("token") or {}).get("value")
         if not token:
             log("[EUserv] token 响应缺少 token.value: {}".format(_snippet(r.text, 500)))
-            return False
+            return "failed"
 
         # Step 6: 续期确认对话框（校验响应 + 收集隐藏字段）
         r = _post_step(session, url, headers, order_id, "6_confirmation_dialog", {
@@ -1116,10 +1219,10 @@ def renew(
             "token": token,
         }, always_dump=True)
         if r is None:
-            return False
+            return "failed"
         ok, extra_fields = validate_confirmation_dialog(r, order_id)
         if not ok:
-            return False
+            return "failed"
 
         # Step 7: 正式续期（现在检查响应，不再盲信）
         payload = {
@@ -1132,28 +1235,42 @@ def renew(
         r = _post_step(session, url, headers, order_id, "7_extend_contract_term",
                        payload, always_dump=True)
         if r is None:
-            return False
+            return "failed"
         status, detail = classify_extend_response(r)
         log("[EUserv] extend_contract_term 判定: {} | {}".format(status, detail))
+        if status == "auto_renew":
+            log("[EUserv] ServerID %s 手动续期被拒：EUserv 称合同自动续期（%s）。"
+                "注意：这不代表服务无需续期——以面板停用警告终检为准" % (order_id, detail))
+            return "auto_renew"
         if status == "error":
-            log("[EUserv] ServerID %s 续期请求被 EUserv 拒绝" % order_id)
-            return False
+            log("[EUserv] ServerID %s 续期请求被 EUserv 拒绝: %s" % (order_id, detail))
+            return "failed"
 
         # Step 8: 事实校验——轮询面板直到到期日后移（替代旧的 time.sleep(5) 盲等）
         applied = wait_extension_applied(session, sess_id, order_id, before_end, headers)
         if not applied:
             log("[EUserv] ServerID %s 续期未生效（面板状态未确认变化）" % order_id)
-        return applied
+            return "failed"
+        return "success"
     except Exception:
         log("[EUserv] 续期过程发生异常:\n" + traceback.format_exc())
-        return False
+        return "failed"
 
 
-def check(sess_id: str, session: requests.session):
+def check(sess_id: str, session: requests.session, skip=()):
+    """面板终检。返回 (仍需续期的服务器列表, 停用警告列表)。
+
+    停用警告（"will be automatically deactivated on ... if it is not extended
+    manually"）是服务级事实：只要它还存在，就说明服务仍需手动续期，
+    无论合同层是否声称自动续期。
+    """
     print("Checking.......")
     d = get_servers(sess_id, session)
     failed = []
     for key, val in d.items():
+        if key in skip:
+            # 合同层声称自动续期：按钮仍在不算失败，但停用警告在下面单独检查
+            continue
         if val:
             failed.append(key)
             try:
@@ -1162,9 +1279,13 @@ def check(sess_id: str, session: requests.session):
                 action = ""
             log("[EUserv] ServerID: %s Renew Failed! 面板操作列='%s'" % (key, _snippet(action, 120)))
 
-    if not failed:
+    warnings = get_deactivation_warnings(session, sess_id)
+    for w in warnings:
+        log("[EUserv] ⚠️ 面板停用警告: %s" % _snippet(w, 220))
+
+    if not failed and not warnings:
         log("[EUserv] ALL Work Done! Enjoy~")
-    return failed
+    return failed, warnings
 
 
 def telegram():
@@ -1207,20 +1328,37 @@ if __name__ == "__main__":
         SERVERS = get_servers(sessid, s)
         log("[EUserv] 檢測到第 {} 個帳號有 {} 台 VPS，正在嘗試續期".format(i + 1, len(SERVERS)))
         failed_servers = []
+        auto_servers = []
         for k, v in SERVERS.items():
             if v:
-                if not renew(sessid, s, passwd_list[i], k):
+                result = renew(sessid, s, passwd_list[i], k)
+                if result == "success":
+                    log("[EUserv] ServerID: %s 德雞續期成功!" % k)
+                elif result == "auto_renew":
+                    log("[EUserv] ServerID: %s EUserv 称合同自动续期（合同层面）；"
+                        "服务是否仍需手动续期，以下方停用警告终检为准" % k)
+                    auto_servers.append(k)
+                else:
                     log("[EUserv] ServerID: %s 德雞中彈倒地!" % k)
                     failed_servers.append(k)
-                else:
-                    log("[EUserv] ServerID: %s 德雞續期成功!" % k)
             else:
                 log("[EUserv] ServerID: %s 不須續期" % k)
         time.sleep(15)
-        # 面板终检：续期按钮仍在的服务器计入失败
-        for k in check(sessid, s):
+        # 面板终检：续期按钮仍在的服务器计入失败（合同层声称自动续期的除外）
+        still_failed, warnings = check(sessid, s, skip=auto_servers)
+        for k in still_failed:
             if k not in failed_servers:
                 failed_servers.append(k)
+        if warnings:
+            # 主界面仍显示"不手动续期将自动停用"——服务级事实，任何
+            # "合同自动续期"的说法都不能盖过它，必须告警让人工介入
+            any_failure = True
+            for k in auto_servers:
+                if k not in failed_servers:
+                    failed_servers.append(k)
+            log("[EUserv] 检测到面板停用警告：服务仍需手动续期或续期未生效，"
+                "请尽快登录 EUserv 后台人工确认！受影响合同: %s"
+                % (", ".join(auto_servers) if auto_servers else "见上方服务器列表"))
         if failed_servers:
             any_failure = True
             log("[EUserv] 本帳號續期失敗清單: %s" % ", ".join(failed_servers))
