@@ -2,9 +2,12 @@
 
 import os
 import re
+import sys
 import json
 import time
 import base64
+
+from datetime import date as _date
 
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
@@ -54,6 +57,63 @@ def log(info: str):
     print(info)
     global desp
     desp = desp + info + "\n"
+
+
+# ===================== 调试与请求记录（用于定位续期失败根因） =====================
+DEBUG_DIR = os.path.join(dir_name, "debug_dumps")
+SENSITIVE_KEYS = {"auth", "pin", "password", "token"}
+
+
+def _mask_payload(data: dict) -> str:
+    """打印请求参数时脱敏敏感字段。"""
+    masked = {
+        k: (str(v)[:2] + "***" if k.lower() in SENSITIVE_KEYS and v else v)
+        for k, v in data.items()
+    }
+    return json.dumps(masked, ensure_ascii=False)
+
+
+def _snippet(text: str, limit: int = 500) -> str:
+    """压缩空白并截断，用于日志摘要。"""
+    s = re.sub(r"\s+", " ", text or "").strip()
+    return s if len(s) <= limit else s[:limit] + f"...[truncated {len(s) - limit} chars]"
+
+
+def dump_response(order_id: str, step: str, r) -> str:
+    """把关键步骤的完整响应落盘，供 GitHub Actions artifact 上传后离线分析。"""
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        fname = f"{order_id}_{step}_{getattr(r, 'status_code', 'xxx')}.html"
+        path = os.path.join(DEBUG_DIR, fname)
+        with open(path, "w", encoding="utf-8", errors="replace") as f:
+            f.write(r.text)
+        return path
+    except Exception as e:
+        print(f"[Debug] dump_response 失败: {e}")
+        return ""
+
+
+def _post_step(session, url, headers, order_id, step, data, always_dump=False):
+    """
+    统一步骤执行器：记录「点击了什么」（subaction+payload），检查 HTTP 状态，
+    记录响应摘要，关键步骤完整落盘。返回 response 或 None（请求级失败）。
+    """
+    log(f"[EUserv] >>> {step} payload={_mask_payload(data)}")
+    try:
+        r = session.post(url, headers=headers, data=data, timeout=30)
+    except requests.RequestException as e:
+        log(f"[EUserv] <<< {step} 请求异常: {e}")
+        return None
+    ctype = r.headers.get("Content-Type", "")
+    log(f"[EUserv] <<< {step} HTTP {r.status_code} type={ctype} len={len(r.text)}")
+    log(f"[EUserv] <<< {step} 摘要: {_snippet(r.text)}")
+    if always_dump or r.status_code != 200:
+        path = dump_response(order_id, step, r)
+        if path:
+            log(f"[EUserv] <<< {step} 完整响应已保存: {path}")
+    if r.status_code != 200:
+        return None
+    return r
 
 
 def login_retry(*args, **kwargs):
@@ -370,19 +430,18 @@ def login(username: str, password: str) -> (str, requests.session):
                 )
                 == -1
             ):
-                log("[Captcha Solver] 驗證通過,登录消息：{}".format(r.text))
+                log("[Captcha Solver] 驗證通過,登录消息摘要：{}".format(_snippet(r.text, 300)))
                 
             else:
                 log("[Captcha Solver] 驗證失敗")
                 return "-1", session
 
         # 改进的PIN码检测逻辑 - 使用更全面的检测条件
-        if ('PIN sent to' in r.text or 
-            'Enter PIN' in r.text or 
+        if ('PIN sent to' in r.text or
+            'Enter PIN' in r.text or
             'kc2_security_password_dialog' in r.text or
             'name="auth"' in r.text or  # 检查是否有PIN输入框
-            'auth' in r.text or  # 检查是否有auth字段
-            'pin' in r.text.lower()):  # 检查是否有pin相关字段
+            'name="pin"' in r.text):  # 检查是否有pin字段
             log("[Login] 检测到需要输入PIN码")
             request_time = time.time()
             
@@ -741,6 +800,231 @@ def extract_pin_from_body(body: str) -> str:
     
     log("[Email] 未找到符合要求的 6 位数字 PIN")
     return None
+# ===================== 续期生效校验（事实判据） =====================
+DATE_RE = re.compile(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b")
+END_HINTS = (
+    "contract end", "end of contract", "contract term end", "end of the contract",
+    "contract expires", "expiry", "expiration",
+    "cancelled at", "canceled at", "cancellation", "cancel at", "terminat",
+    "kündig", "kuendig", "vertragsende", "laufzeitende",
+    "gültig bis", "gueltig bis", "runs until",
+)
+VERIFY_TIMEOUT = 90          # 续期后面板状态轮询总时长（秒）
+VERIFY_INTERVAL = 6          # 轮询间隔（秒）
+POSSIBLE_FROM_MIN_DAYS = 15  # 辅助判据：下次可续期日至少应在 15 天之后
+
+
+def _de_date(m) -> "_date":
+    return _date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+
+
+def extract_dates_with_context(html_text: str, ctx_len: int = 80) -> list:
+    """从 HTML 中提取所有 DD.MM.YYYY 日期及其前置上下文标签。"""
+    text = re.sub(r"<script[\s\S]*?</script>", " ", html_text or "", flags=re.I)
+    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    out = []
+    for m in DATE_RE.finditer(text):
+        try:
+            d = _de_date(m)
+        except ValueError:
+            continue
+        ctx = text[max(0, m.start() - ctx_len):m.start()].strip()
+        out.append((ctx, d))
+    return out
+
+
+def pick_contract_end_date(html_text: str):
+    """从合同详情页挑出合同到期日（最可靠的事实判据）。解析不到时返回 None。"""
+    pairs = extract_dates_with_context(html_text)
+    if pairs:
+        log("[EUserv] 详情页日期: " + "; ".join(
+            "{} ← '{}'".format(d, c[-40:]) for c, d in pairs[:12]))
+    matched = [d for c, d in pairs if any(h in c.lower() for h in END_HINTS)]
+    if not matched:
+        return None
+    return max(matched)
+
+
+def fetch_contract_details(session, sess_id: str, order_id: str, headers: dict):
+    """重新打开合同详情页（与续期第一步相同的导航请求，幂等）。"""
+    return _post_step(
+        session, "https://support.euserv.com/index.iphp", headers,
+        order_id, "poll_contract_details",
+        {
+            "Submit": "Extend contract",
+            "sess_id": sess_id,
+            "ord_no": order_id,
+            "subaction": "choose_order",
+            "show_contract_extension": "1",
+            "choose_order_subaction": "show_contract_details",
+        },
+    )
+
+
+def get_server_action_text(session, sess_id: str, order_id: str) -> str:
+    """服务器列表中该订单操作列的文本（续期按钮 / 'Contract extension possible from ...'）。"""
+    url = "https://support.euserv.com/index.iphp?sess_id=" + sess_id
+    headers = {"user-agent": user_agent, "origin": "https://www.euserv.com"}
+    r = session.get(url=url, headers=headers, timeout=30)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    for tr in soup.select(
+        "#kc2_order_customer_orders_tab_content_1 .kc2_order_table.kc2_content_table tr"
+    ):
+        server_id = tr.select(".td-z1-sp1-kc")
+        if not len(server_id) == 1:
+            continue
+        if server_id[0].get_text().strip() != str(order_id):
+            continue
+        cells = tr.select(".td-z1-sp2-kc .kc2_order_action_container")
+        if cells:
+            return re.sub(r"\s+", " ", cells[0].get_text(" ", strip=True))
+    return ""
+
+
+def classify_extend_response(r) -> (str, str):
+    """
+    判定 extend_contract_term 响应: 返回 (status, detail)
+    status ∈ {"success", "error", "unknown"}
+    """
+    text = r.text or ""
+    try:
+        j = json.loads(text)
+        if isinstance(j, dict):
+            rs = str(j.get("rs", "")).lower()
+            if rs == "success":
+                return "success", _snippet(text, 300)
+            if rs:
+                return "error", _snippet(text, 500)
+            return "unknown", _snippet(text, 300)
+    except ValueError:
+        pass
+    # 非 JSON（不应发生，可能会话失效/被拦截）：去标签后查错误标记
+    plain = re.sub(r"<[^>]+>", " ", text)
+    plain_low = re.sub(r"\s+", " ", plain).lower()
+    for marker in ("error", "fehler", "not possible", "nicht möglich",
+                   "nicht moeglich", "invalid", "ungültig", "ungueltig", "failed"):
+        if marker in plain_low:
+            return "error", _snippet(plain, 500)
+    if "success" in plain_low or "erfolgreich" in plain_low:
+        return "success", _snippet(plain, 300)
+    return "unknown", _snippet(plain, 300)
+
+
+def validate_confirmation_dialog(r, order_id: str):
+    """
+    校验续期确认对话框：检测错误/新增验证码；抓取隐藏表单字段以转发给最终续期请求
+    （适应 EUserv 在对话框里新增必填项的情况）。返回 (ok, extra_fields)。
+    """
+    text = r.text or ""
+    try:
+        j = json.loads(text)
+        if isinstance(j, dict):
+            rs = str(j.get("rs", "")).lower()
+            if rs and rs != "success":
+                log("[EUserv] 续期确认对话框返回错误: {}".format(_snippet(text, 500)))
+                return False, {}
+            # 部分 KC2 接口把对话框 HTML 包在 JSON 字段里
+            for key in ("html", "content", "dialog", "data"):
+                if isinstance(j.get(key), str):
+                    text = j[key]
+                    break
+    except ValueError:
+        pass
+    low = text.lower()
+    if "securimage" in low or "captcha" in low:
+        log("[EUserv] 续期确认对话框要求图形验证码，当前脚本无法处理，判定失败")
+        dump_response(order_id, "confirmation_dialog_captcha", r)
+        return False, {}
+    extra = {}
+    try:
+        soup = BeautifulSoup(text, "html.parser")
+        for inp in soup.find_all("input"):
+            name = inp.get("name")
+            if not name:
+                continue
+            itype = (inp.get("type") or "").lower()
+            if itype == "hidden":
+                extra[name] = inp.get("value", "")
+            elif itype == "checkbox" and inp.has_attr("checked"):
+                extra[name] = inp.get("value", "1")
+    except Exception as e:
+        log("[EUserv] 解析确认对话框表单异常（忽略）: {}".format(e))
+    for k in ("sess_id", "subaction", "token", "ord_id"):
+        extra.pop(k, None)
+    if extra:
+        log("[EUserv] 确认对话框隐藏字段（将转发）: {}".format(list(extra.keys())))
+    return True, extra
+
+
+def wait_extension_applied(session, sess_id: str, order_id: str, before_end, headers: dict) -> bool:
+    """
+    续期请求发出后的事实校验：轮询面板，直到合同到期日后移（最强判据）。
+    到期日基准缺失时退化为辅助判据（按钮消失 + 下次可续期日足够远）。
+    与旧的 time.sleep(5) 盲等不同：状态未变化则判定失败。
+    """
+    deadline = time.time() + VERIFY_TIMEOUT
+    attempt = 0
+    last_action = ""
+    last_r = None
+    while True:
+        time.sleep(VERIFY_INTERVAL)
+        attempt += 1
+        try:
+            r = fetch_contract_details(session, sess_id, order_id, headers)
+            if r is not None:
+                last_r = r
+                after_end = pick_contract_end_date(r.text)
+            else:
+                after_end = None
+        except Exception as e:
+            log("[Verify] 详情页获取异常: {}".format(e))
+            after_end = None
+        try:
+            action = get_server_action_text(session, sess_id, order_id)
+        except Exception as e:
+            log("[Verify] 服务器列表获取异常: {}".format(e))
+            action = ""
+        last_action = action
+        log("[Verify] 第{}次轮询: 到期日={} 操作列='{}'".format(
+            attempt, after_end or "未知", _snippet(action, 120)))
+
+        # 最强判据：到期日后移
+        if before_end and after_end and after_end > before_end:
+            log("[Verify] ✅ 合同到期日已后移 {} → {}，续期确认生效".format(before_end, after_end))
+            return True
+
+        # 辅助判据（仅在缺少到期日基准时允许单独定案）
+        if not before_end:
+            low = action.lower()
+            if "contract extension possible from" in low:
+                m = DATE_RE.search(action)
+                if m:
+                    try:
+                        d = _de_date(m)
+                        if (d - _date.today()).days >= POSSIBLE_FROM_MIN_DAYS:
+                            log("[Verify] ✅（辅助信号）下次可续期为 {}，续期应已生效".format(d))
+                            return True
+                    except ValueError:
+                        pass
+
+        if time.time() >= deadline:
+            break
+
+    # 超时：落盘最后抓到的详情页，按最终面板状态给出结论
+    if last_r is not None:
+        path = dump_response(order_id, "verify_timeout_details", last_r)
+        if path:
+            log("[Verify] 超时时的详情页已保存: {}".format(path))
+    if "extend contract" in last_action.lower():
+        log("[Verify] ❌ 续期按钮仍然存在，续期未生效")
+    else:
+        log("[Verify] ❌ 等待面板状态变化超时（{}s），续期未确认生效".format(VERIFY_TIMEOUT))
+    return False
+
+
 def renew(
     sess_id: str, session: requests.session, password: str, order_id: str
 ) -> bool:
@@ -752,86 +1036,145 @@ def renew(
         "Referer": "https://support.euserv.com/index.iphp",
     }
 
-    r = session.post(url, headers=headers, data={
-        "Submit": "Extend contract",
-        "sess_id": sess_id,
-        "ord_no": order_id,
-        "subaction": "choose_order",
-        "show_contract_extension": "1",
-        "choose_order_subaction": "show_contract_details",
-    })
+    try:
+        # Step 1: 打开合同详情页，记录续期前到期日作为校验基准
+        r = _post_step(session, url, headers, order_id, "1_open_contract_details", {
+            "Submit": "Extend contract",
+            "sess_id": sess_id,
+            "ord_no": order_id,
+            "subaction": "choose_order",
+            "show_contract_extension": "1",
+            "choose_order_subaction": "show_contract_details",
+        }, always_dump=True)
+        if r is None:
+            return False
+        before_end = pick_contract_end_date(r.text)
+        log("[EUserv] ServerID %s 续期前合同到期日: %s" %
+            (order_id, before_end or "未能解析（将使用辅助判据）"))
 
-    r = session.post(url, headers=headers, data={
-        "sess_id": sess_id,
-        "subaction": "kc2_customer_contract_details_get_change_plan_dialog",
-        "ord_id": order_id,
-        "show_manual_extension_if_available": "1",
-    })
+        # Step 2: change plan 对话框
+        r = _post_step(session, url, headers, order_id, "2_change_plan_dialog", {
+            "sess_id": sess_id,
+            "subaction": "kc2_customer_contract_details_get_change_plan_dialog",
+            "ord_id": order_id,
+            "show_manual_extension_if_available": "1",
+        })
+        if r is None:
+            return False
 
-    # send pin code
-    request_time = time.time()
-    log(f'[EUserv] Send pin code to {userId} Time: {unixTimeToDate(request_time)}')
-    r = session.post(url, headers=headers, data={
-        "sess_id": sess_id,
-        "subaction": "show_kc2_security_password_dialog",
-        "prefix":	"kc2_customer_contract_details_extend_contract_",
-        "type":	"1",
-    })
-    if 'PIN sent to ***' in r.text or 'Enter PIN' in r.text or 'kc2_security_password_dialog_prompt' in r.text:
-        log('[EUserv] A PIN has been sent to your email address')
-    else:
-        log("[EUserv] Send Email failed ! 返回消息：{}".format(r.text))
+        # Step 3: 触发安全验证 PIN 邮件
+        request_time = time.time()
+        log(f'[EUserv] Send pin code to {userId} Time: {unixTimeToDate(request_time)}')
+        r = _post_step(session, url, headers, order_id, "3_security_password_dialog", {
+            "sess_id": sess_id,
+            "subaction": "show_kc2_security_password_dialog",
+            "prefix": "kc2_customer_contract_details_extend_contract_",
+            "type": "1",
+        })
+        if r is None:
+            return False
+        if 'PIN sent to ***' in r.text or 'Enter PIN' in r.text or 'kc2_security_password_dialog_prompt' in r.text:
+            log('[EUserv] A PIN has been sent to your email address')
+        else:
+            log("[EUserv] Send Email failed ! 返回消息：{}".format(_snippet(r.text, 1000)))
+            return False
+
+        # Step 4: 从邮箱取 PIN
+        pin_code = wait_for_email(request_time)
+        log("[Email PIN Solver] 驗證碼是: {}".format(pin_code))
+        if not pin_code:
+            return False
+
+        # Step 5: PIN 换 token
+        r = _post_step(session, url, headers, order_id, "5_get_token", {
+            "auth": pin_code,
+            "sess_id": sess_id,
+            "subaction": "kc2_security_password_get_token",
+            "prefix": "kc2_customer_contract_details_extend_contract_",
+            "type": "1",
+            "ident": "kc2_customer_contract_details_extend_contract_" + order_id,
+        }, always_dump=True)
+        if r is None:
+            return False
+        try:
+            j = r.json()
+        except ValueError:
+            log("[EUserv] token 接口返回非 JSON: {}".format(_snippet(r.text, 500)))
+            return False
+        if not j.get("rs") == "success":
+            log("[EUserv] 获取续期 token 失败: {}".format(_snippet(r.text, 500)))
+            return False
+        token = (j.get("token") or {}).get("value")
+        if not token:
+            log("[EUserv] token 响应缺少 token.value: {}".format(_snippet(r.text, 500)))
+            return False
+
+        # Step 6: 续期确认对话框（校验响应 + 收集隐藏字段）
+        r = _post_step(session, url, headers, order_id, "6_confirmation_dialog", {
+            "sess_id": sess_id,
+            "subaction": "kc2_customer_contract_details_get_extend_contract_confirmation_dialog",
+            "token": token,
+        }, always_dump=True)
+        if r is None:
+            return False
+        ok, extra_fields = validate_confirmation_dialog(r, order_id)
+        if not ok:
+            return False
+
+        # Step 7: 正式续期（现在检查响应，不再盲信）
+        payload = {
+            "sess_id": sess_id,
+            "ord_id": order_id,
+            "subaction": "kc2_customer_contract_details_extend_contract_term",
+            "token": token,
+        }
+        payload.update(extra_fields)
+        r = _post_step(session, url, headers, order_id, "7_extend_contract_term",
+                       payload, always_dump=True)
+        if r is None:
+            return False
+        status, detail = classify_extend_response(r)
+        log("[EUserv] extend_contract_term 判定: {} | {}".format(status, detail))
+        if status == "error":
+            log("[EUserv] ServerID %s 续期请求被 EUserv 拒绝" % order_id)
+            return False
+
+        # Step 8: 事实校验——轮询面板直到到期日后移（替代旧的 time.sleep(5) 盲等）
+        applied = wait_extension_applied(session, sess_id, order_id, before_end, headers)
+        if not applied:
+            log("[EUserv] ServerID %s 续期未生效（面板状态未确认变化）" % order_id)
+        return applied
+    except Exception:
+        log("[EUserv] 续期过程发生异常:\n" + traceback.format_exc())
         return False
-    
-    pin_code = wait_for_email(request_time)
-    log("[Email PIN Solver] 驗證碼是: {}".format(pin_code))
-    if not pin_code: return False
-
-    r = session.post(url, headers=headers, data={
-        "auth": pin_code,
-        "sess_id": sess_id,
-        "subaction": "kc2_security_password_get_token",
-        "prefix": "kc2_customer_contract_details_extend_contract_",
-        "type": "1",
-        "ident": "kc2_customer_contract_details_extend_contract_" + order_id,
-    })
-    if not r.json().get("rs") == "success":
-        return False
-    token = r.json().get('token').get('value')
-
-    r = session.post(url, headers=headers, data={
-        "sess_id": sess_id,
-        "subaction": "kc2_customer_contract_details_get_extend_contract_confirmation_dialog",
-        "token": token,
-    })
-    r = session.post(url, headers=headers, data={
-        "sess_id": sess_id,
-        "ord_id": order_id,
-        "subaction": "kc2_customer_contract_details_extend_contract_term",
-        "token": token,
-    })
-
-    time.sleep(5)
-    return True
 
 
 def check(sess_id: str, session: requests.session):
     print("Checking.......")
     d = get_servers(sess_id, session)
-    flag = True
+    failed = []
     for key, val in d.items():
         if val:
-            flag = False
-            log("[EUserv] ServerID: %s Renew Failed!" % key)
+            failed.append(key)
+            try:
+                action = get_server_action_text(session, sess_id, key)
+            except Exception:
+                action = ""
+            log("[EUserv] ServerID: %s Renew Failed! 面板操作列='%s'" % (key, _snippet(action, 120)))
 
-    if flag:
+    if not failed:
         log("[EUserv] ALL Work Done! Enjoy~")
+    return failed
 
 
 def telegram():
+    text = 'EUserv續期日誌\n\n' + desp
+    # Telegram 单条消息上限 4096 字符，超长时保留头尾
+    if len(text) > 4000:
+        text = text[:1500] + "\n...[中間省略]...\n" + text[-2400:]
     data = (
         ('chat_id', TG_USER_ID),
-        ('text', 'EUserv續期日誌\n\n' + desp)
+        ('text', text)
     )
     response = requests.post('https://' + TG_API_HOST + '/bot' + TG_BOT_TOKEN + '/sendMessage', data=data)
     if response.status_code != 200:
@@ -848,6 +1191,7 @@ if __name__ == "__main__":
     if len(user_list) != len(passwd_list):
         log("[EUserv] The number of usernames and passwords do not match!")
         exit(1)
+    any_failure = False
     for i in range(len(user_list)):
         userId = user_list[i]
         log("*" * 30)
@@ -855,21 +1199,35 @@ if __name__ == "__main__":
         sessid, s = login(user_list[i], passwd_list[i])
         if sessid == "-1":
             log("[EUserv] 第 %d 個帳號登入失敗，請檢查登入訊息" % (i + 1))
+            any_failure = True
             continue
         elif not sessid:
+            any_failure = True
             continue
         SERVERS = get_servers(sessid, s)
         log("[EUserv] 檢測到第 {} 個帳號有 {} 台 VPS，正在嘗試續期".format(i + 1, len(SERVERS)))
+        failed_servers = []
         for k, v in SERVERS.items():
             if v:
                 if not renew(sessid, s, passwd_list[i], k):
                     log("[EUserv] ServerID: %s 德雞中彈倒地!" % k)
+                    failed_servers.append(k)
                 else:
                     log("[EUserv] ServerID: %s 德雞續期成功!" % k)
             else:
                 log("[EUserv] ServerID: %s 不須續期" % k)
         time.sleep(15)
-        check(sessid, s)
+        # 面板终检：续期按钮仍在的服务器计入失败
+        for k in check(sessid, s):
+            if k not in failed_servers:
+                failed_servers.append(k)
+        if failed_servers:
+            any_failure = True
+            log("[EUserv] 本帳號續期失敗清單: %s" % ", ".join(failed_servers))
         time.sleep(5)
 
     TG_BOT_TOKEN and TG_USER_ID and TG_API_HOST and telegram()
+    if any_failure:
+        # 非零退出让 GitHub Actions 标红并触发失败通知邮件
+        print("[EUserv] 存在失败的续期/登录，以退出码 1 结束")
+        sys.exit(1)

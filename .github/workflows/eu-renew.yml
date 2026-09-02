@@ -6,7 +6,9 @@ on:
   #  branches:
   #    - main
   schedule:
-    - cron: '11 12 1 * *'
+    # 每 4 天运行一次：续期窗口内失败时能在窗口关闭前自动重试，
+    # 而不是等下个月（那时机器可能已被删除）。不需要续期时脚本只登录一次即退出。
+    - cron: '11 12 */4 * *'
 
 
 permissions:
@@ -50,4 +52,13 @@ jobs:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: python eu.py
-        
+
+      - name: 'Upload debug dumps'
+        # 无论成功失败都上传关键步骤的完整响应，便于事后定位 EUserv 端的真实拒绝原因
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renew-debug-dumps
+          path: debug_dumps/
+          retention-days: 14
+          if-no-files-found: ignore
