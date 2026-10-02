@@ -88,6 +88,15 @@ is not possible because the contract is extended automatically.</td></tr>
 </table></body></html>
 """
 
+# 【2026-10-01 事故】EUserv 用同一个红色样式（td.verdana14px-rot-b）展示
+# 续期成功提示——颜色不可靠，措辞才是判据。旧版把这条红字当错误 → 假失败告警。
+EXTEND_SUCCESS_RED_LINE_PAGE = """
+<html><body>
+<table class="kc2_content_table">
+<tr><td colspan="2" class="verdana14px-rot-b">Thank you! The contract has been extended.</td></tr>
+</table></body></html>
+"""
+
 # 主界面服务级停用警告（用户在控制台实际看到的文字，2026-09-02）
 OVERVIEW_WITH_DEACTIVATION_WARNING = """
 <html><body>
@@ -253,6 +262,7 @@ def test_extend_response_classification():
         ('<html><body>Fehler: nicht möglich</body></html>', "error"),
         ('<html><body>some neutral page</body></html>', "unknown"),
         (EXTEND_AUTO_RENEW_PAGE, "auto_renew"),
+        (EXTEND_SUCCESS_RED_LINE_PAGE, "success"),
     ]
     for text, want in cases:
         got, _ = eu.classify_extend_response(FakeResponse(text))
@@ -261,6 +271,30 @@ def test_extend_response_classification():
     _, detail = eu.classify_extend_response(FakeResponse(EXTEND_AUTO_RENEW_PAGE))
     assert "not possible" in detail
     print("✓ test_extend_response_classification")
+
+
+def test_red_line_success_still_requires_fact_verification():
+    """【2026-10-01 事故回归】红字行是"Thank you! The contract has been extended."
+    时不得误判 failed；但也绝不能盲信措辞——到期日后移才算数。
+    FakeSession 的 extend 响应是 text/html（真实响应即如此）。"""
+    # 到期日后移 → success
+    s = FakeSession(DETAILS_BEFORE, "Extend contract", EXTEND_SUCCESS_RED_LINE_PAGE)
+    orig_post = s.post
+    state = {"n": 0}
+
+    def post_advance(url, headers=None, data=None, timeout=None):
+        if data.get("subaction") == "choose_order":
+            state["n"] += 1
+            if state["n"] > 1:
+                return FakeResponse(DETAILS_AFTER)
+        return orig_post(url, headers=headers, data=data, timeout=timeout)
+
+    s.post = post_advance
+    assert run_renew(s, timeout=60) == "success"
+    # 措辞说成功但面板到期日不动 → 仍必须 failed
+    s2 = FakeSession(DETAILS_BEFORE, '<a>Extend contract</a>', EXTEND_SUCCESS_RED_LINE_PAGE)
+    assert run_renew(s2, timeout=0) == "failed"
+    print("✓ test_red_line_success_still_requires_fact_verification (事故回归)")
 
 
 def test_pick_contract_end_date():
@@ -374,6 +408,7 @@ if __name__ == "__main__":
     test_confirmation_dialog_captcha()
     test_hidden_fields_forwarded()
     test_extend_response_classification()
+    test_red_line_success_still_requires_fact_verification()
     test_pick_contract_end_date()
     test_confirmation_dialog_validation()
     test_mask_payload()

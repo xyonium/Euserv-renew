@@ -969,6 +969,13 @@ def get_deactivation_warnings(session, sess_id: str) -> list:
     return list(dict.fromkeys(warnings))
 
 
+# EUserv 的 KC2 成功/失败提示共用同一个红色样式 td.verdana14px-rot-b，
+# 颜色不可靠，必须按文本措辞区分（2026-10-01 事故：
+# "Thank you! The contract has been extended." 用红字展示，被误判为失败）。
+KC2_SUCCESS_HINTS = ("thank you", "has been extended",
+                     "erfolgreich verlängert", "wurde verlängert")
+
+
 def classify_extend_response(r) -> (str, str):
     """
     判定 extend_contract_term 响应: 返回 (status, detail)
@@ -992,6 +999,10 @@ def classify_extend_response(r) -> (str, str):
         return "auto_renew", err or "contract is extended automatically"
     err = extract_kc2_error_text(text)
     if err:
+        # 红字行也可能是成功提示（措辞可靠，颜色不可靠）——
+        # 真正的失败仍会继续走 wait_extension_applied 事实校验，不会误报成功
+        if any(m in err.lower() for m in KC2_SUCCESS_HINTS):
+            return "success", _snippet(err, 300)
         return "error", _snippet(err, 500)
     plain_low = _strip_html(text).lower()
     for marker in ("error", "fehler", "not possible", "nicht möglich",
